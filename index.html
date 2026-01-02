@@ -1,0 +1,814 @@
+import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, Legend, ResponsiveContainer, AreaChart, Area } from 'recharts';
+import { Upload, TrendingUp, AlertCircle, ArrowUpRight, ArrowDownRight, DollarSign, CheckCircle2, XCircle, Trash2, Filter, Calendar, ArrowRightLeft, FileCheck, Euro } from 'lucide-react';
+
+// --- Constants ---
+const EXCHANGE_RATE = 0.96; // 1 USD = 0.96 EUR (Fixed approx rate)
+const ACCENT_COLOR = '#09212f'; // Custom Accent Color
+
+// --- Types ---
+
+interface Transaction {
+  uniqueId: string;
+  shopName: string;
+  shopUrl: string;
+  amount: number;
+  date: string; // ISO Date string
+  timestamp: number;
+  periodLabel: string;
+  category: string;
+  sourceFile: string;
+  chargeId?: string;
+}
+
+interface DiffResult {
+  shopUrl: string;
+  shopName: string;
+  oldAmount: number;
+  newAmount: number;
+  diff: number;
+  status: 'new' | 'lost' | 'changed' | 'stable';
+}
+
+// --- Utils & Parser ---
+
+const getStartDateFromPeriod = (label: string): number => {
+  try {
+    const parts = label.split('-');
+    if (parts.length > 0) {
+      const startStr = parts[0].trim().replace(/,/g, '');
+      const date = new Date(startStr);
+      if (!isNaN(date.getTime())) return date.getTime();
+    }
+    const date = new Date(label);
+    if (!isNaN(date.getTime())) return date.getTime();
+    return 0;
+  } catch (e) {
+    return 0;
+  }
+};
+
+const parseCSVLine = (line: string): string[] => {
+  const result: string[] = [];
+  let current = '';
+  let inQuotes = false;
+  
+  for (let i = 0; i < line.length; i++) {
+    const char = line[i];
+    if (char === '"') {
+      if (i + 1 < line.length && line[i + 1] === '"') {
+         current += '"';
+         i++;
+      } else {
+         inQuotes = !inQuotes;
+      }
+    } else if (char === ',' && !inQuotes) {
+      result.push(current.trim());
+      current = '';
+    } else {
+      current += char;
+    }
+  }
+  result.push(current.trim());
+  return result.map(s => s.replace(/^"|"$/g, '').trim()); 
+};
+
+const formatShopName = (url: string): string => {
+  if (!url) return 'Unbekannter Shop';
+  let name = url.replace('.myshopify.com', '').replace('https://', '');
+  name = name.split('-').map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(' ');
+  return name;
+};
+
+const parseCSV = (text: string, fileName: string): Transaction[] => {
+  const lines = text.split('\n');
+  let headerIndex = -1;
+  
+  for (let i = 0; i < Math.min(lines.length, 50); i++) {
+    const line = lines[i];
+    if ((line.includes('Partner Share') && line.includes('Shop')) || 
+        (line.includes('Payout Period') && line.includes('Shop'))) {
+      headerIndex = i;
+      break;
+    }
+  }
+
+  if (headerIndex === -1) {
+    console.warn(`Kein Header gefunden in Datei: ${fileName}`);
+    return [];
+  }
+
+  const headers = parseCSVLine(lines[headerIndex]);
+  
+  const colMap = {
+    shop: headers.findIndex(h => h === 'Shop'),
+    name: headers.findIndex(h => h === 'Name'),
+    amount: headers.findIndex(h => h === 'Partner Share'),
+    date: headers.findIndex(h => h === 'Charge Creation Time'),
+    category: headers.findIndex(h => h === 'Category'),
+    payoutPeriod: headers.findIndex(h => h === 'Payout Period'),
+    chargeId: headers.findIndex(h => h === 'Charge ID'),
+  };
+
+  const transactions: Transaction[] = [];
+
+  for (let i = headerIndex + 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.trim()) continue; 
+    if (!line.includes(',')) continue;
+
+    const row = parseCSVLine(line);
+    
+    if (colMap.shop === -1 || colMap.amount === -1) continue;
+    if (!row[colMap.shop]) continue;
+
+    const amountVal = row[colMap.amount];
+    if (!amountVal) continue;
+    const amount = parseFloat(amountVal);
+    
+    if (isNaN(amount)) continue;
+
+    const rawShop = row[colMap.shop];
+    const shopName = colMap.name !== -1 && row[colMap.name] 
+      ? row[colMap.name] 
+      : formatShopName(rawShop);
+
+    let dateStr = colMap.date !== -1 ? row[colMap.date] : '';
+    let dateObj = new Date(dateStr);
+    
+    if (isNaN(dateObj.getTime())) {
+       dateObj = new Date(); 
+    }
+
+    let periodLabel = 'Unbekannt';
+    if (colMap.payoutPeriod !== -1 && row[colMap.payoutPeriod]) {
+      periodLabel = row[colMap.payoutPeriod];
+    } else {
+      const monthName = dateObj.toLocaleString('de-DE', { month: 'long', year: 'numeric' });
+      if (fileName.includes('01.-16')) periodLabel = `01.-16. ${monthName} (Legacy)`;
+      else if (fileName.includes('16.-01')) periodLabel = `16.-Ende ${monthName} (Legacy)`;
+      else periodLabel = fileName.replace('.csv', '');
+    }
+
+    const chargeId = colMap.chargeId !== -1 ? row[colMap.chargeId] : undefined;
+    const uniqueId = chargeId 
+      ? `cid-${chargeId}` 
+      : `legacy-${rawShop}-${dateStr}-${amount}`;
+
+    transactions.push({
+      uniqueId: uniqueId,
+      shopName: shopName,
+      shopUrl: rawShop,
+      amount: amount,
+      date: dateObj.toISOString(),
+      timestamp: dateObj.getTime(),
+      periodLabel: periodLabel,
+      category: colMap.category !== -1 ? row[colMap.category] : 'General',
+      sourceFile: fileName,
+      chargeId: chargeId
+    });
+  }
+  
+  return transactions;
+};
+
+// --- Components ---
+
+const Card = ({ children, className = "" }: { children: React.ReactNode; className?: string }) => (
+  <div className={`bg-white rounded-3xl shadow-sm border border-gray-100 p-6 ${className}`}>
+    {children}
+  </div>
+);
+
+const StatCard = ({ title, value, subtext, trend, secondaryValue, icon: Icon }: any) => (
+  <Card>
+    <div className="flex justify-between items-start mb-4">
+      <div className="p-3 rounded-2xl" style={{ backgroundColor: `${ACCENT_COLOR}15`, color: ACCENT_COLOR }}>
+        <Icon size={24} />
+      </div>
+      {trend !== undefined && trend !== 0 && (
+        <span className={`flex items-center text-sm font-medium ${trend > 0 ? 'text-green-600' : 'text-red-600'}`}>
+          {trend > 0 ? '+' : ''}{trend}%
+          {trend > 0 ? <ArrowUpRight size={16} className="ml-1" /> : <ArrowDownRight size={16} className="ml-1" />}
+        </span>
+      )}
+    </div>
+    <h3 className="text-gray-500 text-sm font-medium mb-1">{title}</h3>
+    <div className="text-3xl font-bold text-gray-900">{value}</div>
+    {secondaryValue && <div className="text-sm font-medium text-gray-500 mt-1">{secondaryValue}</div>}
+    {subtext && <div className="text-xs text-gray-400 mt-2">{subtext}</div>}
+  </Card>
+);
+
+const EmptyState = ({ onUpload }: { onUpload: (e: React.ChangeEvent<HTMLInputElement>) => void }) => (
+  <div className="flex flex-col items-center justify-center py-20 px-4 text-center border-2 border-dashed border-gray-200 rounded-3xl bg-gray-50">
+    <div className="bg-white p-4 rounded-full shadow-sm mb-4">
+      <Upload className="h-8 w-8" style={{ color: ACCENT_COLOR }} />
+    </div>
+    <h3 className="text-lg font-semibold text-gray-900 mb-2">CSV Dateien importieren</h3>
+    <p className="text-gray-500 max-w-md mb-6">
+      Lade deine Shopify Provisions-Exporte hoch.
+      Duplikate werden automatisch erkannt und entfernt.
+    </p>
+    <label 
+      className="cursor-pointer inline-flex items-center px-6 py-3 border border-transparent text-base font-medium rounded-full shadow-sm text-white transition-colors hover:opacity-90"
+      style={{ backgroundColor: ACCENT_COLOR }}
+    >
+      Dateien auswählen
+      <input type="file" multiple accept=".csv" className="hidden" onChange={onUpload} />
+    </label>
+  </div>
+);
+
+export default function CommissionAI() {
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'analysis'>('dashboard');
+  const [transactions, setTransactions] = useState<Transaction[]>([]);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [notification, setNotification] = useState<string | null>(null);
+  const [debugLog, setDebugLog] = useState<string[]>([]);
+
+  // Filters
+  const [selectedPeriod, setSelectedPeriod] = useState<string>('all');
+  const [selectedMonth, setSelectedMonth] = useState<string>('all');
+  
+  // Comparison State
+  const [compareA, setCompareA] = useState<string>('');
+  const [compareB, setCompareB] = useState<string>('');
+
+  // Initial Demo Data
+  useEffect(() => {
+    const demoData: Transaction[] = [
+      { uniqueId: 'd1', shopName: 'Heavy Saurus', shopUrl: 'heavy.myshopify.com', amount: 400.00, date: '2025-10-31', timestamp: new Date('2025-10-31').getTime(), periodLabel: 'October 16 - November 1', category: 'Plus', sourceFile: 'demo', chargeId: 'demo1' },
+      { uniqueId: 'd2', shopName: 'Deutsche Post', shopUrl: 'dhl.myshopify.com', amount: 290.00, date: '2025-11-15', timestamp: new Date('2025-11-15').getTime(), periodLabel: 'November 1 - November 16', category: 'Dev', sourceFile: 'demo', chargeId: 'demo2' },
+    ];
+    setTransactions(demoData);
+  }, []);
+
+  const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = event.target.files;
+    if (!files || files.length === 0) return;
+
+    setIsProcessing(true);
+    setNotification(null);
+    setDebugLog([]);
+
+    let processedCount = 0;
+    let allNewTransactions: Transaction[] = [];
+    const totalFiles = files.length;
+    const fileNames = Array.from(files).map(f => f.name);
+
+    Array.from(files).forEach(file => {
+      const reader = new FileReader();
+      
+      reader.onload = (e) => {
+        const text = e.target?.result as string;
+        const fileTx = parseCSV(text, file.name);
+        
+        console.log(`Parsed ${file.name}: ${fileTx.length} items`);
+        
+        allNewTransactions = [...allNewTransactions, ...fileTx];
+        processedCount++;
+
+        if (processedCount === totalFiles) {
+          finishUpload(allNewTransactions, fileNames);
+        }
+      };
+
+      reader.onerror = () => {
+        console.error(`Error reading ${file.name}`);
+        processedCount++;
+        if (processedCount === totalFiles) finishUpload(allNewTransactions, fileNames);
+      };
+
+      reader.readAsText(file);
+    });
+  };
+
+  const finishUpload = (newItems: Transaction[], fileNames: string[]) => {
+    setTransactions(prev => {
+      let currentData = prev.some(t => t.sourceFile === 'demo') ? [] : prev;
+      
+      const mergedMap = new Map<string, Transaction>();
+      
+      currentData.forEach(t => mergedMap.set(t.uniqueId, t));
+      newItems.forEach(t => mergedMap.set(t.uniqueId, t));
+      
+      const mergedArray = Array.from(mergedMap.values());
+      
+      setDebugLog(l => [`Processed ${fileNames.length} files.`, `Total items found: ${newItems.length}`, `Total unique items: ${mergedArray.length}`]);
+      
+      return mergedArray;
+    });
+    
+    setIsProcessing(false);
+    setNotification(`${newItems.length} Transaktionen aus ${fileNames.length} Dateien geladen.`);
+    setTimeout(() => setNotification(null), 4000);
+    
+    setSelectedPeriod('all');
+    setSelectedMonth('all');
+  };
+
+  const clearData = () => {
+    setTransactions([]);
+    setDebugLog([]);
+    setNotification("Daten gelöscht.");
+  };
+
+  // --- Derived Data Lists ---
+
+  const availableMonths = useMemo(() => {
+    const months = new Set<string>();
+    transactions.forEach(t => {
+      const d = new Date(t.date);
+      if (!isNaN(d.getTime())) {
+        months.add(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`);
+      }
+    });
+    return Array.from(months).sort().reverse();
+  }, [transactions]);
+
+  const availablePeriods = useMemo(() => {
+    const periods = Array.from(new Set(transactions.map(t => t.periodLabel)));
+    return periods.sort((a, b) => getStartDateFromPeriod(a) - getStartDateFromPeriod(b));
+  }, [transactions]);
+
+  useEffect(() => {
+    if (availablePeriods.length >= 2) {
+      if (!compareA || !availablePeriods.includes(compareA)) setCompareA(availablePeriods[availablePeriods.length - 2]);
+      if (!compareB || !availablePeriods.includes(compareB)) setCompareB(availablePeriods[availablePeriods.length - 1]);
+    } else if (availablePeriods.length === 1) {
+      if (!compareB) setCompareB(availablePeriods[0]);
+    }
+  }, [availablePeriods]);
+
+  // --- Dashboard Filter Logic ---
+
+  const filteredTransactions = useMemo(() => {
+    return transactions.filter(t => {
+      let matchPeriod = true;
+      let matchMonth = true;
+
+      if (selectedPeriod !== 'all') {
+        matchPeriod = t.periodLabel === selectedPeriod;
+      }
+
+      if (selectedMonth !== 'all') {
+        const d = new Date(t.date);
+        const tMonth = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+        matchMonth = tMonth === selectedMonth;
+      }
+
+      return matchPeriod && matchMonth;
+    });
+  }, [transactions, selectedPeriod, selectedMonth]);
+
+  // Aggregated Top Partners
+  const topPartners = useMemo(() => {
+    const groups: Record<string, { name: string, category: string, total: number }> = {};
+    filteredTransactions.forEach(t => {
+       if (!groups[t.shopUrl]) {
+          groups[t.shopUrl] = { name: t.shopName, category: t.category, total: 0 };
+       }
+       groups[t.shopUrl].total += t.amount;
+    });
+    return Object.values(groups).sort((a, b) => b.total - a.total).slice(0, 50);
+  }, [filteredTransactions]);
+
+  const stats = useMemo(() => {
+    const total = filteredTransactions.reduce((sum, t) => sum + t.amount, 0);
+    const count = filteredTransactions.length;
+    
+    let trend = 0;
+    if (selectedMonth !== 'all') {
+       const [yr, mo] = selectedMonth.split('-').map(Number);
+       const prevDate = new Date(yr, mo - 2); 
+       const prevMonthStr = `${prevDate.getFullYear()}-${String(prevDate.getMonth() + 1).padStart(2, '0')}`;
+       
+       const prevData = transactions.filter(t => {
+         const d = new Date(t.date);
+         return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}` === prevMonthStr;
+       });
+       
+       const prevTotal = prevData.reduce((sum, t) => sum + t.amount, 0);
+       if (prevTotal > 0) trend = Math.round(((total - prevTotal) / prevTotal) * 100);
+    }
+
+    return { total, count, trend };
+  }, [filteredTransactions, selectedMonth, transactions]);
+
+  // Chart Data
+  const chartData = useMemo(() => {
+    const isMonthlyView = selectedMonth !== 'all';
+    const groups: Record<string, number> = {};
+    
+    filteredTransactions.forEach(t => {
+      let key = '';
+      if (isMonthlyView) {
+        const d = new Date(t.date);
+        key = `${d.getDate()}.`; 
+      } else {
+        key = t.periodLabel;
+      }
+      groups[key] = (groups[key] || 0) + t.amount;
+    });
+
+    if (isMonthlyView) {
+      return Object.entries(groups)
+        .sort((a, b) => parseInt(a[0]) - parseInt(b[0]))
+        .map(([name, value]) => ({ name, value }));
+    } else {
+      return availablePeriods
+        .filter(p => groups[p] !== undefined)
+        .map(p => ({
+          name: p.length > 20 ? p.substring(0, 12) + '...' : p,
+          fullName: p,
+          value: groups[p] || 0
+        }));
+    }
+  }, [filteredTransactions, selectedMonth, availablePeriods]);
+
+
+  // --- Comparison Logic ---
+
+  const comparisonData = useMemo(() => {
+    if (!compareA || !compareB) return [];
+
+    const getItems = (selection: string) => {
+      if (selection.match(/^\d{4}-\d{2}$/)) {
+         return transactions.filter(t => {
+            const d = new Date(t.date);
+            return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}` === selection;
+         });
+      }
+      return transactions.filter(t => t.periodLabel === selection);
+    };
+
+    const itemsA = getItems(compareA);
+    const itemsB = getItems(compareB);
+
+    const mapA = new Map<string, number>();
+    itemsA.forEach(t => mapA.set(t.shopUrl, (mapA.get(t.shopUrl) || 0) + t.amount));
+
+    const mapB = new Map<string, number>();
+    itemsB.forEach(t => mapB.set(t.shopUrl, (mapB.get(t.shopUrl) || 0) + t.amount));
+
+    const allShops = new Set([...mapA.keys(), ...mapB.keys()]);
+    const diffs: DiffResult[] = [];
+
+    allShops.forEach(shopUrl => {
+      const valA = mapA.get(shopUrl) || 0;
+      const valB = mapB.get(shopUrl) || 0;
+      const diff = valB - valA;
+      
+      const tx = transactions.find(t => t.shopUrl === shopUrl);
+      const name = tx ? tx.shopName : formatShopName(shopUrl);
+
+      let status: 'stable' | 'new' | 'lost' | 'changed' = 'stable';
+      if (valA === 0 && valB > 0) status = 'new';
+      else if (valA > 0 && valB === 0) status = 'lost';
+      else if (Math.abs(diff) > 0.01) status = 'changed';
+
+      if (status !== 'stable') {
+        diffs.push({ shopUrl, shopName: name, oldAmount: valA, newAmount: valB, diff, status });
+      }
+    });
+
+    return diffs.sort((a, b) => Math.abs(b.diff) - Math.abs(a.diff));
+  }, [compareA, compareB, transactions]);
+
+
+  return (
+    <div className="min-h-screen bg-[#F9FAFB] text-gray-900 pb-20" style={{ fontFamily: "'ease', sans-serif" }}>
+      {/* Font Injection */}
+      <style>{`
+        @font-face {
+          font-family: 'ease';
+          src: url('EaseStandard-Regular.woff2') format('woff2'),
+               url('EaseStandard-Regular.woff') format('woff'),
+               url('EaseStandard-Regular.ttf') format('truetype');
+          font-weight: normal;
+          font-style: normal;
+        }
+      `}</style>
+
+      {/* Toast */}
+      {notification && (
+        <div 
+          className="fixed top-4 right-4 text-white px-6 py-3 rounded-xl shadow-lg z-50 animate-fade-in flex items-center"
+          style={{ backgroundColor: ACCENT_COLOR }}
+        >
+          <CheckCircle2 size={18} className="mr-2 text-green-400" />
+          {notification}
+        </div>
+      )}
+
+      {/* Header */}
+      <header className="bg-white border-b border-gray-100 sticky top-0 z-20">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+          <div className="flex justify-between items-center h-16">
+            <div className="flex items-center space-x-3">
+              {/* Logo Area - Expects logo.png to be present or falls back */}
+              <div className="h-10 w-10 overflow-hidden rounded-lg flex items-center justify-center bg-gray-50 border border-gray-100">
+                <img 
+                   src="logo.png" 
+                   alt="Logo" 
+                   className="h-full w-full object-contain"
+                   onError={(e) => {
+                     // Fallback if image fails
+                     (e.target as HTMLImageElement).src = "/api/placeholder/40/40";
+                     (e.target as HTMLImageElement).style.padding = '4px';
+                   }}
+                />
+              </div>
+              
+              <span className="text-xl font-bold" style={{ color: ACCENT_COLOR }}>
+                Shopify Commissions
+              </span>
+            </div>
+            
+            <nav className="flex space-x-1 bg-gray-100 p-1 rounded-xl">
+              <button 
+                onClick={() => setActiveTab('dashboard')}
+                className={`px-4 py-2 text-sm font-medium rounded-lg transition-all ${activeTab === 'dashboard' ? 'bg-white shadow-sm' : 'hover:text-gray-700'}`}
+                style={{ color: activeTab === 'dashboard' ? ACCENT_COLOR : '#6B7280' }}
+              >
+                Übersicht
+              </button>
+              <button 
+                onClick={() => setActiveTab('analysis')}
+                className={`px-4 py-2 text-sm font-medium rounded-lg transition-all ${activeTab === 'analysis' ? 'bg-white shadow-sm' : 'hover:text-gray-700'}`}
+                style={{ color: activeTab === 'analysis' ? ACCENT_COLOR : '#6B7280' }}
+              >
+                Abgleich
+              </button>
+            </nav>
+
+            <div className="flex items-center space-x-3">
+               {transactions.length > 0 && (
+                 <button onClick={clearData} className="p-2 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors" title="Daten löschen">
+                   <Trash2 size={18} />
+                 </button>
+               )}
+               <label 
+                 className={`cursor-pointer px-4 py-2 rounded-lg text-sm font-medium transition-colors flex items-center text-white hover:opacity-90`}
+                 style={{ backgroundColor: isProcessing ? '#9CA3AF' : ACCENT_COLOR }}
+               >
+                  {isProcessing ? <span className="animate-pulse">Verarbeite...</span> : (
+                    <>
+                      <Upload size={16} className="mr-2" />
+                      Upload
+                    </>
+                  )}
+                  <input type="file" multiple accept=".csv" className="hidden" onChange={handleFileUpload} disabled={isProcessing} />
+               </label>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        
+        {debugLog.length > 0 && (
+          <div className="mb-6 p-4 text-xs rounded-xl font-mono bg-blue-50 text-blue-800">
+            <strong>System Status:</strong>
+            <ul className="list-disc ml-4 mt-1">
+              {debugLog.map((log, i) => <li key={i}>{log}</li>)}
+            </ul>
+          </div>
+        )}
+
+        {transactions.length === 0 ? (
+          <EmptyState onUpload={handleFileUpload} />
+        ) : (
+          <>
+            {activeTab === 'dashboard' && (
+              <div className="space-y-6">
+                
+                {/* Filter Bar */}
+                <div className="bg-white p-4 rounded-2xl shadow-sm border border-gray-100 flex flex-col md:flex-row md:items-center gap-4">
+                  <div className="flex items-center text-gray-500">
+                    <Filter size={18} className="mr-2" />
+                    <span className="font-medium text-sm">Filter:</span>
+                  </div>
+                  
+                  <select 
+                    value={selectedPeriod} 
+                    onChange={(e) => { setSelectedPeriod(e.target.value); setSelectedMonth('all'); }} 
+                    className="bg-gray-50 border-none text-sm rounded-lg focus:ring-2 py-2 px-3 text-gray-700 font-medium"
+                    style={{ outlineColor: ACCENT_COLOR }}
+                  >
+                    <option value="all">Alle Abrechnungszeiträume</option>
+                    {availablePeriods.map(p => (
+                      <option key={p} value={p}>{p}</option>
+                    ))}
+                  </select>
+
+                  <span className="text-gray-300 hidden md:inline">|</span>
+
+                  <select 
+                    value={selectedMonth} 
+                    onChange={(e) => { setSelectedMonth(e.target.value); setSelectedPeriod('all'); }} 
+                    className="bg-gray-50 border-none text-sm rounded-lg focus:ring-2 py-2 px-3 text-gray-700 font-medium"
+                    style={{ outlineColor: ACCENT_COLOR }}
+                  >
+                    <option value="all">Alle Kalendermonate</option>
+                    {availableMonths.map(m => {
+                      const [y, mo] = m.split('-');
+                      const date = new Date(parseInt(y), parseInt(mo) - 1);
+                      return <option key={m} value={m}>{date.toLocaleString('de-DE', { month: 'long', year: 'numeric' })}</option>
+                    })}
+                  </select>
+
+                  <div className="ml-auto flex items-center text-xs text-gray-400 bg-gray-50 px-3 py-1 rounded-full">
+                    <FileCheck size={12} className="mr-1" />
+                    {filteredTransactions.length} Posten
+                  </div>
+                </div>
+
+                {/* Stats */}
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                  <StatCard 
+                    title="Umsatz (Gefiltert)" 
+                    value={`$${stats.total.toLocaleString('de-DE', { minimumFractionDigits: 2 })}`} 
+                    secondaryValue={`~ ${(stats.total * EXCHANGE_RATE).toLocaleString('de-DE', { minimumFractionDigits: 2 })} €`}
+                    subtext={selectedMonth !== 'all' ? 'In diesem Monat' : 'Gesamter ausgewählter Bereich'}
+                    trend={stats.trend}
+                    icon={DollarSign} 
+                  />
+                  <StatCard 
+                    title="Anzahl Zahlungen" 
+                    value={stats.count} 
+                    subtext="Erfolgreiche Transaktionen"
+                    icon={CheckCircle2} 
+                  />
+                  <StatCard 
+                    title="Top Partner (Summe)" 
+                    value={topPartners.length > 0 ? `$${topPartners[0].total.toLocaleString('de-DE', { maximumFractionDigits: 0 })}` : '-'}
+                    secondaryValue={topPartners.length > 0 ? `~ ${(topPartners[0].total * EXCHANGE_RATE).toLocaleString('de-DE', { maximumFractionDigits: 0 })} €` : ''}
+                    subtext="Umsatzstärkster Partner"
+                    icon={TrendingUp} 
+                  />
+                </div>
+
+                {/* Chart & List */}
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                  <Card className="lg:col-span-2">
+                    <h3 className="text-lg font-semibold mb-6">Umsatzverlauf</h3>
+                    <div className="h-72 w-full">
+                      <ResponsiveContainer width="100%" height="100%">
+                        <AreaChart data={chartData}>
+                          <defs>
+                            <linearGradient id="colorUmsatz" x1="0" y1="0" x2="0" y2="1">
+                              <stop offset="5%" stopColor={ACCENT_COLOR} stopOpacity={0.1}/>
+                              <stop offset="95%" stopColor={ACCENT_COLOR} stopOpacity={0}/>
+                            </linearGradient>
+                          </defs>
+                          <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#E5E7EB" />
+                          <XAxis dataKey="name" axisLine={false} tickLine={false} tick={{fill: '#6B7280', fontSize: 11}} dy={10} interval="preserveStartEnd" />
+                          <YAxis axisLine={false} tickLine={false} tick={{fill: '#6B7280'}} tickFormatter={(value) => `$${value}`} />
+                          <RechartsTooltip 
+                            contentStyle={{ borderRadius: '12px', border: 'none', boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1)' }}
+                            formatter={(value: number) => [`$${value.toFixed(2)}`, 'Umsatz']}
+                          />
+                          <Area type="monotone" dataKey="value" name="Umsatz" stroke={ACCENT_COLOR} strokeWidth={3} fillOpacity={1} fill="url(#colorUmsatz)" />
+                        </AreaChart>
+                      </ResponsiveContainer>
+                    </div>
+                  </Card>
+
+                  <Card>
+                    <h3 className="text-lg font-semibold mb-4">Top Partner (Summiert)</h3>
+                    <div className="space-y-3 max-h-72 overflow-y-auto custom-scrollbar pr-2">
+                      {topPartners
+                        .slice(0, 10) 
+                        .map((t, idx) => (
+                        <div key={idx} className="flex items-center justify-between p-2 hover:bg-gray-50 rounded-xl transition-colors">
+                          <div className="flex items-center overflow-hidden">
+                            <div className="w-8 h-8 flex-shrink-0 rounded-full text-white flex items-center justify-center font-bold text-xs mr-3" style={{ backgroundColor: `${ACCENT_COLOR}cc` }}>
+                              {idx + 1}
+                            </div>
+                            <div className="truncate">
+                              <div className="font-medium text-gray-900 text-sm truncate w-28 lg:w-32">{t.name}</div>
+                              <div className="text-xs text-gray-400">{t.category}</div>
+                            </div>
+                          </div>
+                          <div className="text-right">
+                            <div className="font-semibold text-gray-900 text-sm">${t.total.toFixed(0)}</div>
+                            <div className="text-xs text-gray-400">~ {(t.total * EXCHANGE_RATE).toFixed(0)} €</div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </Card>
+                </div>
+              </div>
+            )}
+
+            {activeTab === 'analysis' && (
+              <div className="space-y-6">
+                
+                {/* Comparison Selector */}
+                <div className="bg-white p-6 rounded-3xl shadow-sm border border-gray-100">
+                  <h2 className="text-lg font-bold text-gray-900 mb-4 flex items-center">
+                    <ArrowRightLeft className="mr-2" style={{ color: ACCENT_COLOR }} />
+                    Zeitraum-Vergleich
+                  </h2>
+                  <div className="flex flex-col md:flex-row gap-4 items-center">
+                    <div className="flex-1 w-full">
+                      <label className="block text-xs font-medium text-gray-500 mb-1">Basis (Alt)</label>
+                      <select 
+                        value={compareA} 
+                        onChange={(e) => setCompareA(e.target.value)}
+                        className="w-full bg-gray-50 border-gray-200 rounded-xl text-sm"
+                      >
+                         <optgroup label="Abrechnungszeiträume">
+                           {availablePeriods.map(p => <option key={p} value={p}>{p}</option>)}
+                         </optgroup>
+                         <optgroup label="Ganze Monate">
+                           {availableMonths.map(m => <option key={m} value={m}>{m}</option>)}
+                         </optgroup>
+                      </select>
+                    </div>
+                    
+                    <div className="hidden md:block text-gray-300 pt-5"><ArrowRightLeft size={20} /></div>
+                    
+                    <div className="flex-1 w-full">
+                      <label className="block text-xs font-medium text-gray-500 mb-1">Vergleich (Neu)</label>
+                      <select 
+                        value={compareB} 
+                        onChange={(e) => setCompareB(e.target.value)}
+                        className="w-full bg-gray-50 border-gray-200 rounded-xl text-sm"
+                      >
+                         <optgroup label="Abrechnungszeiträume">
+                           {availablePeriods.map(p => <option key={p} value={p}>{p}</option>)}
+                         </optgroup>
+                         <optgroup label="Ganze Monate">
+                           {availableMonths.map(m => <option key={m} value={m}>{m}</option>)}
+                         </optgroup>
+                      </select>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Diff Table */}
+                <div className="bg-white rounded-3xl shadow-sm border border-gray-100 overflow-hidden">
+                  <div className="p-4 border-b border-gray-100 flex justify-between items-center bg-gray-50">
+                     <h3 className="font-semibold text-gray-700">Abweichungen</h3>
+                     <div className="flex space-x-2">
+                        <span className="px-2 py-1 bg-red-100 text-red-700 rounded text-xs font-medium">Verloren</span>
+                        <span className="px-2 py-1 bg-green-100 text-green-700 rounded text-xs font-medium">Neu</span>
+                        <span className="px-2 py-1 bg-yellow-100 text-yellow-700 rounded text-xs font-medium">Verändert</span>
+                     </div>
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="min-w-full divide-y divide-gray-200">
+                      <thead className="bg-white">
+                        <tr>
+                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Shop</th>
+                          <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Alt</th>
+                          <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Neu</th>
+                          <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Diff</th>
+                        </tr>
+                      </thead>
+                      <tbody className="bg-white divide-y divide-gray-200">
+                        {comparisonData.length === 0 ? (
+                          <tr><td colSpan={5} className="px-6 py-8 text-center text-gray-400">Keine Daten für diesen Vergleich verfügbar.</td></tr>
+                        ) : (
+                          comparisonData.map((item, idx) => (
+                            <tr key={idx} className="hover:bg-gray-50">
+                              <td className="px-6 py-3 whitespace-nowrap">
+                                {item.status === 'new' && <span className="text-xs font-bold text-green-600 bg-green-50 px-2 py-1 rounded">NEU</span>}
+                                {item.status === 'lost' && <span className="text-xs font-bold text-red-600 bg-red-50 px-2 py-1 rounded">VERLOREN</span>}
+                                {item.status === 'changed' && <span className="text-xs font-bold text-yellow-600 bg-yellow-50 px-2 py-1 rounded">ÄNDERUNG</span>}
+                              </td>
+                              <td className="px-6 py-3 whitespace-nowrap">
+                                <div className="text-sm font-medium text-gray-900">{item.shopName}</div>
+                                <div className="text-xs text-gray-400">{item.shopUrl}</div>
+                              </td>
+                              <td className="px-6 py-3 whitespace-nowrap text-right text-sm text-gray-500">
+                                {item.oldAmount > 0 ? `$${item.oldAmount.toFixed(2)}` : '-'}
+                              </td>
+                              <td className="px-6 py-3 whitespace-nowrap text-right text-sm text-gray-900">
+                                {item.newAmount > 0 ? `$${item.newAmount.toFixed(2)}` : '-'}
+                              </td>
+                              <td className="px-6 py-3 whitespace-nowrap text-right text-sm">
+                                <span className={item.diff > 0 ? 'text-green-600' : 'text-red-600'}>
+                                  {item.diff > 0 ? '+' : ''}{item.diff.toFixed(2)}
+                                </span>
+                              </td>
+                            </tr>
+                          ))
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+            )}
+          </>
+        )}
+      </main>
+    </div>
+  );
+}
